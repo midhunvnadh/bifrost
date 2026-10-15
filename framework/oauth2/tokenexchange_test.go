@@ -703,3 +703,291 @@ func TestRefreshExchangeAdminTokenUseIdPCredentialsMissingClientID(t *testing.T)
 		t.Fatalf("token endpoint hits = %d, want 0 (must fail before sending client_id= empty)", got)
 	}
 }
+
+// idjagSubjectResolver is a fakeIdPResolver that also supplies stored SSO subjects.
+type idjagSubjectResolver struct {
+	fakeIdPResolver
+	subject *schemas.IDJAGSubjectToken
+	calls   atomic.Int64
+}
+
+// IDJAGSubjectForUser returns the configured subject or ErrExchangeSubjectTokenMissing.
+func (r *idjagSubjectResolver) IDJAGSubjectForUser(_ context.Context, _ string) (*schemas.IDJAGSubjectToken, error) {
+	r.calls.Add(1)
+	if r.subject == nil {
+		return nil, schemas.ErrExchangeSubjectTokenMissing
+	}
+	return r.subject, nil
+}
+
+// idjagLegs is a fake identity provider (leg 1) and upstream authorization server (leg 2).
+type idjagLegs struct {
+	idp, as           *httptest.Server
+	idpForm, asForm   url.Values
+	idpHits, asHits   atomic.Int64
+	issuedTokenType   string
+	asStatus          int
+	asGrantTypes      []string
+	upstreamDiscovery *httptest.Server
+}
+
+// newIDJAGLegs starts both token endpoints plus an MCP server whose discovery points at the AS.
+func newIDJAGLegs(t *testing.T) *idjagLegs {
+	t.Helper()
+	l := &idjagLegs{issuedTokenType: "urn:ietf:params:oauth:token-type:id-jag", asStatus: http.StatusOK,
+		asGrantTypes: []string{"authorization_code", "urn:ietf:params:oauth:grant-type:jwt-bearer"}}
+	l.idp = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		l.idpHits.Add(1)
+		_ = r.ParseForm()
+		l.idpForm = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "id-jag-jwt", "issued_token_type": l.issuedTokenType, "token_type": "N_A", "expires_in": 300})
+	}))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		l.asHits.Add(1)
+		_ = r.ParseForm()
+		l.asForm = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		if l.asStatus != http.StatusOK {
+			w.WriteHeader(l.asStatus)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant", "error_description": "user not linked"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "saas-token", "token_type": "Bearer", "expires_in": 3600})
+	})
+	l.as = httptest.NewServer(mux)
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": l.as.URL, "authorization_endpoint": l.as.URL + "/authorize", "token_endpoint": l.as.URL + "/token", "grant_types_supported": l.asGrantTypes})
+	})
+	upstream := http.NewServeMux()
+	upstream.HandleFunc("/.well-known/oauth-protected-resource", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"resource": l.upstreamDiscovery.URL + "/mcp", "authorization_servers": []string{l.as.URL}})
+	})
+	upstream.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+l.upstreamDiscovery.URL+`/.well-known/oauth-protected-resource"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	l.upstreamDiscovery = httptest.NewServer(upstream)
+	t.Cleanup(func() { l.idp.Close(); l.as.Close(); l.upstreamDiscovery.Close() })
+	return l
+}
+
+// idjagClientConfig is an id_jag token_exchange client for the fake upstream.
+func (l *idjagLegs) idjagClientConfig(withOverride bool) *schemas.MCPClientConfig {
+	cfg := &schemas.MCPClientConfig{
+		ID: "client-xaa", Name: "Linear", AuthType: schemas.MCPAuthTypeTokenExchange,
+		ConnectionString: schemas.NewSecretVar(l.upstreamDiscovery.URL + "/mcp"),
+		TokenExchange: &schemas.MCPTokenExchangeConfig{
+			Audience: l.as.URL, UseIdPCredentials: true, Profile: schemas.TokenExchangeProfileIDJAG,
+			Scopes: []string{"issues.read"}, ResourceClientID: schemas.NewSecretVar("bifrost-at-linear"),
+			ResourceClientSecret: schemas.NewSecretVar("linear-secret"),
+		},
+	}
+	if withOverride {
+		endpoint := l.as.URL + "/token"
+		cfg.TokenExchange.ResourceTokenEndpoint = &endpoint
+	}
+	return cfg
+}
+
+// newIDJAGProvider wires a provider whose IdP is l.idp, with SSO app credentials.
+func (l *idjagLegs) newIDJAGProvider(resolver *idjagSubjectResolver) *OAuth2Provider {
+	p := NewOAuth2Provider(nil, nil)
+	p.retryBaseDelay = time.Millisecond
+	resolver.available = true
+	resolver.idp = &schemas.TokenExchangeIdP{TokenEndpoint: l.idp.URL, GrantShape: schemas.TokenExchangeGrantRFC8693, IdPClientID: "sso-app", IdPClientSecret: "sso-secret"}
+	p.SetTokenExchangeIdPResolver(resolver)
+	return p
+}
+
+// idjagUserContext is a user-mode request context carrying an inbound bearer
+// that must never reach either leg.
+func idjagUserContext() *schemas.BifrostContext {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyUserID, "user-1")
+	ctx.SetValue(schemas.BifrostContextKeyMCPInboundBearer, "inbound-access-token")
+	return ctx
+}
+
+// subjectResolver is a resolver whose stored session yields token of tokenType.
+func subjectResolver(token, tokenType string) *idjagSubjectResolver {
+	return &idjagSubjectResolver{subject: &schemas.IDJAGSubjectToken{Token: token, TokenType: tokenType}}
+}
+
+func TestIDJAGExchange_BothLegsAndCaching(t *testing.T) {
+	l := newIDJAGLegs(t)
+	resolver := subjectResolver("okta-refresh", schemas.TokenTypeRefreshToken)
+	p := l.newIDJAGProvider(resolver)
+	cfg := l.idjagClientConfig(true)
+	ctx := idjagUserContext()
+
+	token, err := p.GetExchangedAccessToken(ctx, cfg)
+	if err != nil || token != "saas-token" {
+		t.Fatalf("token=%q err=%v, want saas-token", token, err)
+	}
+	for key, want := range map[string]string{
+		"grant_type":           "urn:ietf:params:oauth:grant-type:token-exchange",
+		"requested_token_type": "urn:ietf:params:oauth:token-type:id-jag",
+		"subject_token":        "okta-refresh",
+		"subject_token_type":   schemas.TokenTypeRefreshToken,
+		"audience":             l.as.URL,
+		"scope":                "issues.read",
+		"client_id":            "sso-app",
+		"client_secret":        "sso-secret",
+	} {
+		if got := l.idpForm.Get(key); got != want {
+			t.Errorf("leg 1 form[%s] = %q, want %q", key, got, want)
+		}
+	}
+	for key, want := range map[string]string{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": "id-jag-jwt",
+		"client_id": "bifrost-at-linear", "client_secret": "linear-secret",
+	} {
+		if got := l.asForm.Get(key); got != want {
+			t.Errorf("leg 2 form[%s] = %q, want %q", key, got, want)
+		}
+	}
+	if l.idpForm.Has("resource") {
+		t.Error("leg 1 must not send resource unless configured; Okta rejects it without a resource indicator")
+	}
+	if strings.Contains(l.idpForm.Encode(), "inbound-access-token") || strings.Contains(l.asForm.Encode(), "inbound-access-token") {
+		t.Fatal("the inbound access token must never be sent on either leg")
+	}
+
+	if _, err := p.GetExchangedAccessToken(ctx, cfg); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if l.idpHits.Load() != 1 || l.asHits.Load() != 1 {
+		t.Fatalf("hits idp=%d as=%d, want one each (cached)", l.idpHits.Load(), l.asHits.Load())
+	}
+	if resolver.calls.Load() != 1 {
+		t.Fatalf("subject resolved %d times, want once: a cache hit must not load the stored session", resolver.calls.Load())
+	}
+}
+
+func TestIDJAGExchange_SendsConfiguredResource(t *testing.T) {
+	l := newIDJAGLegs(t)
+	p := l.newIDJAGProvider(subjectResolver("t", schemas.TokenTypeIDToken))
+	cfg := l.idjagClientConfig(true)
+	cfg.TokenExchange.Resource = "https://linear.app/mcp"
+	if _, err := p.GetExchangedAccessToken(idjagUserContext(), cfg); err != nil {
+		t.Fatalf("GetExchangedAccessToken: %v", err)
+	}
+	if got := l.idpForm.Get("resource"); got != "https://linear.app/mcp" {
+		t.Fatalf("resource = %q, want the configured indicator", got)
+	}
+}
+
+func TestIDJAGExchange_DiscoversUpstreamTokenEndpoint(t *testing.T) {
+	l := newIDJAGLegs(t)
+	p := l.newIDJAGProvider(subjectResolver("okta-id-token", schemas.TokenTypeIDToken))
+	ctx := idjagUserContext()
+	if _, err := p.GetExchangedAccessToken(ctx, l.idjagClientConfig(false)); err != nil {
+		t.Fatalf("GetExchangedAccessToken: %v", err)
+	}
+	if l.asHits.Load() != 1 {
+		t.Fatalf("discovered token endpoint was not called")
+	}
+
+	l.asGrantTypes = []string{"authorization_code"}
+	p2 := l.newIDJAGProvider(subjectResolver("okta-id-token", schemas.TokenTypeIDToken))
+	if _, err := p2.GetExchangedAccessToken(ctx, l.idjagClientConfig(false)); err == nil || !strings.Contains(err.Error(), "jwt-bearer") {
+		t.Fatalf("err = %v, want a jwt-bearer support error", err)
+	}
+}
+
+func TestIDJAGExchange_SubjectResolution(t *testing.T) {
+	l := newIDJAGLegs(t)
+	resolver := subjectResolver("stored-refresh", schemas.TokenTypeRefreshToken)
+	p := l.newIDJAGProvider(resolver)
+	if _, err := p.GetExchangedAccessToken(idjagUserContext(), l.idjagClientConfig(true)); err != nil {
+		t.Fatalf("stored-session exchange: %v", err)
+	}
+	if resolver.calls.Load() != 1 || l.idpForm.Get("subject_token") != "stored-refresh" {
+		t.Fatalf("stored session subject was not used")
+	}
+
+	empty := l.newIDJAGProvider(&idjagSubjectResolver{})
+	if _, err := empty.GetExchangedAccessToken(idjagUserContext(), l.idjagClientConfig(true)); !errors.Is(err, schemas.ErrExchangeSubjectTokenMissing) {
+		t.Fatalf("err = %v, want ErrExchangeSubjectTokenMissing", err)
+	}
+
+	vkCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	vkCtx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-1")
+	if _, err := p.GetExchangedAccessToken(vkCtx, l.idjagClientConfig(true)); !errors.Is(err, schemas.ErrExchangeSubjectTokenMissing) {
+		t.Fatalf("vk identity: err = %v, want ErrExchangeSubjectTokenMissing", err)
+	}
+}
+
+func TestIDJAGExchange_Rejections(t *testing.T) {
+	t.Run("identity provider issues the wrong token type", func(t *testing.T) {
+		l := newIDJAGLegs(t)
+		l.issuedTokenType = "urn:ietf:params:oauth:token-type:access_token"
+		p := l.newIDJAGProvider(subjectResolver("t", schemas.TokenTypeIDToken))
+		_, err := p.GetExchangedAccessToken(idjagUserContext(), l.idjagClientConfig(true))
+		if err == nil || l.asHits.Load() != 0 {
+			t.Fatalf("err=%v as hits=%d, want refusal before leg 2", err, l.asHits.Load())
+		}
+	})
+	t.Run("upstream refuses the ID-JAG", func(t *testing.T) {
+		l := newIDJAGLegs(t)
+		l.asStatus = http.StatusBadRequest
+		p := l.newIDJAGProvider(subjectResolver("t", schemas.TokenTypeIDToken))
+		_, err := p.GetExchangedAccessToken(idjagUserContext(), l.idjagClientConfig(true))
+		var rejected *schemas.TokenExchangeRejectedError
+		if !errors.As(err, &rejected) || !strings.Contains(rejected.Detail, "user not linked") {
+			t.Fatalf("err = %v, want TokenExchangeRejectedError naming the upstream reason", err)
+		}
+	})
+}
+
+func TestIDJAGAdminCredential_RetainsRefreshSubject(t *testing.T) {
+	l := newIDJAGLegs(t)
+	resolver := subjectResolver("admin-refresh", schemas.TokenTypeRefreshToken)
+	p := l.newIDJAGProvider(resolver)
+	response, err := p.ExchangeAdminCredential(idjagUserContext(), l.idjagClientConfig(true), "ignored-access-token")
+	if err != nil {
+		t.Fatalf("ExchangeAdminCredential: %v", err)
+	}
+	if response.AccessToken != "saas-token" || response.RefreshToken != "admin-refresh" {
+		t.Fatalf("response = %+v, want saas-token with the IdP refresh token retained for renewal", response)
+	}
+	if l.idpForm.Get("subject_token") != "admin-refresh" {
+		t.Fatalf("admin exchange must use the admin's IdP subject, not the access token")
+	}
+
+	resolver.subject = &schemas.IDJAGSubjectToken{Token: "admin-id", TokenType: schemas.TokenTypeIDToken}
+	response, err = p.ExchangeAdminCredential(idjagUserContext(), l.idjagClientConfig(true), "")
+	if err != nil || response.RefreshToken != "" {
+		t.Fatalf("an ID-token subject cannot renew; got refresh=%q err=%v", response.RefreshToken, err)
+	}
+}
+
+func TestValidateProfile(t *testing.T) {
+	base := func() *schemas.MCPTokenExchangeConfig {
+		return &schemas.MCPTokenExchangeConfig{Audience: "a", Profile: schemas.TokenExchangeProfileIDJAG, ResourceClientID: schemas.NewSecretVar("c")}
+	}
+	if err := base().ValidateProfile(); err != nil {
+		t.Fatalf("valid id_jag config: %v", err)
+	}
+	missing := base()
+	missing.ResourceClientID = nil
+	if missing.ValidateProfile() == nil {
+		t.Fatal("id_jag without resource_client_id must fail")
+	}
+	insecure := base()
+	endpoint := "http://saas.example.com/token"
+	insecure.ResourceTokenEndpoint = &endpoint
+	if insecure.ValidateProfile() == nil {
+		t.Fatal("a non-loopback http resource_token_endpoint must fail")
+	}
+	unknown := base()
+	unknown.Profile = "other"
+	if unknown.ValidateProfile() == nil {
+		t.Fatal("unknown profile must fail")
+	}
+	if (&schemas.MCPTokenExchangeConfig{Audience: "a"}).ValidateProfile() != nil {
+		t.Fatal("the direct profile needs no id_jag fields")
+	}
+}

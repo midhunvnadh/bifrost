@@ -77,6 +77,9 @@ func (p *OAuth2Provider) GetExchangedAccessToken(ctx *schemas.BifrostContext, co
 	if err := validateExchangeConfig(config); err != nil {
 		return "", err
 	}
+	if config.TokenExchange.IsIDJAG() {
+		return p.getIDJAGAccessToken(ctx, config)
+	}
 	mode := ctx.MCPAuthMode()
 	// Session identities are caller-asserted opaque strings with no
 	// verification, so they can never anchor a delegated exchange; the
@@ -122,6 +125,11 @@ func (p *OAuth2Provider) GetExchangedAccessToken(ctx *schemas.BifrostContext, co
 func (p *OAuth2Provider) ExchangeAdminCredential(ctx context.Context, config *schemas.MCPClientConfig, subjectToken string) (*schemas.OAuth2TokenExchangeResponse, error) {
 	if err := validateExchangeConfig(config); err != nil {
 		return nil, err
+	}
+	// The id_jag profile ignores subjectToken (an access token): its subject is
+	// the admin's ID or refresh token, resolved from ctx.
+	if config.TokenExchange.IsIDJAG() {
+		return p.exchangeIDJAGAdminCredential(ctx, config)
 	}
 	subjectToken = strings.TrimSpace(subjectToken)
 	if subjectToken == "" {
@@ -187,6 +195,9 @@ func (p *OAuth2Provider) refreshExchangeAdminToken(ctx context.Context, token *t
 	}
 	if err := validateExchangeConfig(clientConfig); err != nil {
 		return err
+	}
+	if clientConfig.TokenExchange.IsIDJAG() {
+		return p.refreshIDJAGAdminToken(ctx, token, clientConfig)
 	}
 
 	if strings.TrimSpace(token.RefreshToken) == "" {
@@ -337,15 +348,7 @@ func (p *OAuth2Provider) performExchangeCtx(ctx context.Context, config *schemas
 	if err != nil {
 		return cachedUserToken{}, err
 	}
-	ttl := defaultExchangedTokenTTL
-	if response.ExpiresIn > 0 {
-		ttl = time.Duration(response.ExpiresIn) * time.Second
-	}
-	if margined := ttl - exchangeExpirySafetyMargin; margined > 0 {
-		ttl = margined
-	}
-	expiresAt := time.Now().Add(ttl)
-	return cachedUserToken{accessToken: response.AccessToken, expiresAt: &expiresAt}, nil
+	return cachedTokenFromResponse(response), nil
 }
 
 // validateExchangeConfig guards the invariants the create/update path
@@ -356,6 +359,9 @@ func validateExchangeConfig(config *schemas.MCPClientConfig) error {
 	}
 	if config.TokenExchange == nil || config.TokenExchange.Audience == "" {
 		return fmt.Errorf("MCP client %s is missing its token_exchange audience", config.Name)
+	}
+	if err := config.TokenExchange.ValidateProfile(); err != nil {
+		return fmt.Errorf("MCP client %s: %w", config.Name, err)
 	}
 	if config.TokenExchange.UseIdPCredentials {
 		return nil
