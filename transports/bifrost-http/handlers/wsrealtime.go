@@ -516,31 +516,12 @@ func (h *WSRealtimeHandler) runRealtimeSession(
 	// Tag the session context with transport type for downstream logging/metadata.
 	bifrostCtx.SetValue(schemas.BifrostContextKeyRealtimeTransport, "websocket")
 
-	wsURL, urlErr := rtProvider.RealtimeWebSocketURL(key, model, intent)
-	if urlErr != nil {
-		clientConn.writeRealtimeError(urlErr)
+	upstream, releaseUpstream, upstreamErr := h.openRealtimeUpstream(bifrostCtx, rtProvider, providerKey, key, model, intent)
+	if upstreamErr != nil {
+		clientConn.writeRealtimeError(upstreamErr)
 		return
 	}
-	realtimeHeaders, headerErr := rtProvider.RealtimeHeaders(bifrostCtx, key)
-	if headerErr != nil {
-		clientConn.writeRealtimeError(headerErr)
-		return
-	}
-	var proxyConfig *schemas.ProxyConfig
-	if providerCfg, cfgErr := h.config.GetProviderConfigRaw(providerKey); cfgErr == nil && providerCfg != nil {
-		proxyConfig = providerCfg.ProxyConfig
-	}
-
-	upstream, err := h.pool.Get(bfws.PoolKey{
-		Provider: providerKey,
-		KeyID:    key.ID,
-		Endpoint: wsURL,
-	}, mapToHTTPHeader(realtimeHeaders), proxyConfig)
-	if err != nil {
-		clientConn.writeRealtimeError(newRealtimeWireBifrostError(502, "server_error", err.Error()))
-		return
-	}
-	defer h.pool.Discard(upstream)
+	defer releaseUpstream()
 
 	logErr := runRealtimeRelays(clientConn.conn,
 		func() error {
@@ -556,6 +537,46 @@ func (h *WSRealtimeHandler) runRealtimeSession(
 	if logErr != nil {
 		logger.Warn("realtime websocket relay ended for %s/%s on %s: %v", providerKey, model, path, logErr)
 	}
+}
+
+// openRealtimeUpstream uses the provider's own transport when it has one, else a pooled WebSocket.
+func (h *WSRealtimeHandler) openRealtimeUpstream(
+	bifrostCtx *schemas.BifrostContext,
+	rtProvider schemas.RealtimeProvider,
+	providerKey schemas.ModelProvider,
+	key schemas.Key,
+	model string,
+	intent string,
+) (schemas.RealtimeUpstream, func(), *schemas.BifrostError) {
+	if connector, ok := rtProvider.(schemas.RealtimeConnector); ok {
+		upstream, bifrostErr := connector.ConnectRealtime(bifrostCtx, key, model, intent)
+		if bifrostErr != nil {
+			return nil, nil, bifrostErr
+		}
+		return upstream, func() { _ = upstream.Close() }, nil
+	}
+
+	wsURL, urlErr := rtProvider.RealtimeWebSocketURL(key, model, intent)
+	if urlErr != nil {
+		return nil, nil, urlErr
+	}
+	realtimeHeaders, headerErr := rtProvider.RealtimeHeaders(bifrostCtx, key)
+	if headerErr != nil {
+		return nil, nil, headerErr
+	}
+	var proxyConfig *schemas.ProxyConfig
+	if providerCfg, cfgErr := h.config.GetProviderConfigRaw(providerKey); cfgErr == nil && providerCfg != nil {
+		proxyConfig = providerCfg.ProxyConfig
+	}
+	upstream, err := h.pool.Get(bfws.PoolKey{
+		Provider: providerKey,
+		KeyID:    key.ID,
+		Endpoint: wsURL,
+	}, mapToHTTPHeader(realtimeHeaders), proxyConfig)
+	if err != nil {
+		return nil, nil, newRealtimeWireBifrostError(502, "server_error", err.Error())
+	}
+	return upstream, func() { h.pool.Discard(upstream) }, nil
 }
 
 // runRealtimeRelays runs the two relays of a realtime session, each on its own goroutine, and
@@ -578,7 +599,7 @@ func runRealtimeRelays(conn *ws.Conn, toProvider, toClient func() error, closeBo
 func (h *WSRealtimeHandler) relayClientToRealtimeProvider(
 	clientConn *realtimeClientConn,
 	session *bfws.Session,
-	upstream *bfws.UpstreamConn,
+	upstream schemas.RealtimeUpstream,
 	provider schemas.RealtimeProvider,
 	bifrostCtx *schemas.BifrostContext,
 	providerKey schemas.ModelProvider,
@@ -621,7 +642,7 @@ func (h *WSRealtimeHandler) relayClientToRealtimeProvider(
 func (h *WSRealtimeHandler) processRealtimeClientMessage(
 	clientConn *realtimeClientConn,
 	session *bfws.Session,
-	upstream *bfws.UpstreamConn,
+	upstream schemas.RealtimeUpstream,
 	provider schemas.RealtimeProvider,
 	bifrostCtx *schemas.BifrostContext,
 	providerKey schemas.ModelProvider,
@@ -799,7 +820,7 @@ func realtimeTurnCompletionContent(session *bfws.Session, event *schemas.Bifrost
 func (h *WSRealtimeHandler) relayRealtimeProviderToClient(
 	clientConn *realtimeClientConn,
 	session *bfws.Session,
-	upstream *bfws.UpstreamConn,
+	upstream schemas.RealtimeUpstream,
 	provider schemas.RealtimeProvider,
 	bifrostCtx *schemas.BifrostContext,
 	providerKey schemas.ModelProvider,
